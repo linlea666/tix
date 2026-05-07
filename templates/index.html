@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tix · 多币种黑天鹅监控</title>
+  <meta http-equiv="refresh" content="15" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d10;
+      --card: #15181d;
+      --line: #232830;
+      --fg: #e6e6e6;
+      --mut: #9aa0a6;
+      --accent: #4f8cff;
+      --good: #2ecc71;
+      --bad: #ff4d4f;
+      --warn: #f39c12;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+            "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    .wrap { max-width: 1280px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 4px; font-weight: 600; letter-spacing: .3px; }
+    h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600;
+         display: flex; align-items: center; gap: 8px; }
+    .sub { color: var(--mut); margin-bottom: 18px; }
+    .grid { display: grid; gap: 14px;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+    .card { background: var(--card); border: 1px solid var(--line);
+            border-radius: 12px; padding: 16px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mut); }
+    .dot.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
+    .dot.off { background: var(--bad); }
+    .row { display: grid; grid-template-columns: 130px 1fr;
+           gap: 8px; align-items: center; margin: 6px 0; }
+    .row.dual { grid-template-columns: 130px 1fr 1fr; }
+    label { color: var(--mut); font-size: 12px; }
+    input, select, button { font: inherit; }
+    input[type=text], input:not([type]) {
+      width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+      background: #0e1116; color: var(--fg); border-radius: 6px;
+    }
+    input[type=checkbox] { width: auto; }
+    .price { font-size: 22px; font-weight: 600; letter-spacing: .3px; }
+    .meta { color: var(--mut); font-size: 12px; }
+    .btn {
+      padding: 9px 14px; border: 0; border-radius: 8px; cursor: pointer;
+      background: var(--accent); color: #fff; font-weight: 500;
+      text-decoration: none; display: inline-block;
+    }
+    .btn.ghost { background: transparent; color: var(--fg);
+                 border: 1px solid var(--line); }
+    .btn.danger { background: #b3261e; }
+    .toolbar { display: flex; align-items: center; gap: 10px;
+               margin: 14px 0 18px; flex-wrap: wrap; }
+    .pill { padding: 3px 10px; font-size: 12px; background: #0e1116;
+            border: 1px solid var(--line); border-radius: 999px;
+            color: var(--mut); }
+    .alerts { max-height: 360px; overflow: auto; padding-right: 4px; }
+    .alert { padding: 8px 0; border-bottom: 1px dashed var(--line); }
+    .alert:last-child { border-bottom: 0; }
+    .alert .t { color: var(--mut); font-size: 12px; }
+    .section-title { margin: 28px 0 12px; font-size: 18px; }
+    .group { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .ago { color: var(--mut); font-size: 12px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>🦢 Tix · 多币种黑天鹅监控</h1>
+  <div class="sub">
+    FastAPI · Binance Combined WebSocket · 多通道告警 · 自动重连 + 阈值迟滞
+  </div>
+
+  <div class="toolbar">
+    <span class="pill">币种 <b>{{ cfg.coins|length }}</b></span>
+    <span class="pill">告警历史 <b>{{ snapshot.alerts|length }}</b></span>
+    {% set live_n = snapshot.coins.values()|selectattr('connected')|list|length %}
+    <span class="pill">在线 <b>{{ live_n }}</b> / {{ snapshot.coins|length }}</span>
+    <a class="btn ghost" href="/test">测试通知</a>
+    <a class="btn ghost" href="/api/snapshot" target="_blank">/api/snapshot</a>
+    <a class="btn ghost" href="/healthz" target="_blank">/healthz</a>
+  </div>
+
+  <h2 class="section-title">📈 实时行情</h2>
+  <div class="grid">
+    {% for symbol, c in cfg.coins.items() %}
+      {% set s = snapshot.coins.get(symbol, {}) %}
+      <div class="card">
+        <h2>
+          <span class="dot {% if s.get('connected') %}on{% else %}off{% endif %}"></span>
+          {{ symbol|upper }}
+          <span class="ago" style="margin-left:auto">
+            {% if s.get('last_update') %}
+              {{ ((now - s.get('last_update'))|round(0, 'floor'))|int }}s ago
+            {% else %}—{% endif %}
+          </span>
+        </h2>
+        <div class="price">{{ '%g'|format(s.get('last_price') or 0) }}</div>
+        <div class="meta">
+          history pts: {{ s.get('history_len') or 0 }} ·
+          triggered: {{ (s.get('triggered') or {})|length }}
+        </div>
+        <div class="meta" style="margin-top:6px">
+          ↓ {{ c.price_below_list|join(', ') or '—' }}
+          &nbsp;|&nbsp;
+          ↑ {{ c.price_above_list|join(', ') or '—' }}
+          <br>
+          flash {{ c.flash_crash.window_sec }}s/{{ c.flash_crash.drop_pct }}% ·
+          slow {{ c.slow_crash.window_sec }}s/{{ c.slow_crash.drop_pct }}% ·
+          cd {{ c.cooldown }}s · hyst {{ c.hysteresis_pct }}%
+        </div>
+        <form method="post" action="/coin/{{ symbol }}/delete"
+              style="margin-top:10px"
+              onsubmit="return confirm('删除币种 {{ symbol|upper }} ？');">
+          <button class="btn danger" type="submit">删除该币种</button>
+        </form>
+      </div>
+    {% endfor %}
+
+    <div class="card">
+      <h2>📜 最近告警</h2>
+      <div class="alerts">
+        {% if not snapshot.alerts %}
+          <div class="meta">暂无告警</div>
+        {% else %}
+          {% for a in snapshot.alerts %}
+            <div class="alert">
+              <div>{{ a.title }}</div>
+              <div class="t">
+                {{ a.symbol|upper }} · {{ a.kind }} · price={{ a.price }} ·
+                {{ ((now - a.ts)|round(0, 'floor'))|int }}s ago
+              </div>
+            </div>
+          {% endfor %}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <h2 class="section-title">⚙️ 配置</h2>
+  <form method="post" action="/save">
+    <div class="grid">
+      {% for symbol, c in cfg.coins.items() %}
+        <div class="card">
+          <h2>{{ symbol|upper }}</h2>
+          <input type="hidden" name="coin__{{ symbol }}__symbol" value="{{ symbol }}">
+          <div class="row">
+            <label>跌破列表</label>
+            <input name="coin__{{ symbol }}__below"
+                   value="{{ c.price_below_list|join(', ') }}"
+                   placeholder="逗号分隔，例如 80000, 75000">
+          </div>
+          <div class="row">
+            <label>突破列表</label>
+            <input name="coin__{{ symbol }}__above"
+                   value="{{ c.price_above_list|join(', ') }}"
+                   placeholder="逗号分隔，例如 90000, 95000">
+          </div>
+          <div class="row dual">
+            <label>瞬时窗/跌幅%</label>
+            <input name="coin__{{ symbol }}__flash_window"
+                   value="{{ c.flash_crash.window_sec }}">
+            <input name="coin__{{ symbol }}__flash_drop"
+                   value="{{ c.flash_crash.drop_pct }}">
+          </div>
+          <div class="row dual">
+            <label>崩盘窗/跌幅%</label>
+            <input name="coin__{{ symbol }}__slow_window"
+                   value="{{ c.slow_crash.window_sec }}">
+            <input name="coin__{{ symbol }}__slow_drop"
+                   value="{{ c.slow_crash.drop_pct }}">
+          </div>
+          <div class="row dual">
+            <label>冷却/迟滞%</label>
+            <input name="coin__{{ symbol }}__cooldown"
+                   value="{{ c.cooldown }}">
+            <input name="coin__{{ symbol }}__hysteresis"
+                   value="{{ c.hysteresis_pct }}">
+          </div>
+        </div>
+      {% endfor %}
+
+      <div class="card">
+        <h2>➕ 新增币种</h2>
+        <div class="row">
+          <label>Symbol（小写）</label>
+          <input name="add_symbol" placeholder="例如：solusdt">
+        </div>
+        <div class="meta">提交后会以默认参数加入，可在保存后再编辑。币种会自动接入到 WS 单连接。</div>
+      </div>
+
+      <div class="card">
+        <h2>📨 通知通道</h2>
+        <div class="row">
+          <label>
+            <input type="checkbox" name="pushover_enabled"
+                   {% if cfg.pushover.enabled %}checked{% endif %}>
+            Pushover
+          </label>
+          <span class="meta">紧急推送 (priority=2 + retry/expire)</span>
+        </div>
+        <div class="row"><label>Token</label>
+          <input name="pushover_token" value="{{ cfg.pushover.token }}"></div>
+        <div class="row"><label>User</label>
+          <input name="pushover_user" value="{{ cfg.pushover.user }}"></div>
+
+        <div class="row" style="margin-top:8px">
+          <label>
+            <input type="checkbox" name="telegram_enabled"
+                   {% if cfg.telegram.enabled %}checked{% endif %}>
+            Telegram
+          </label>
+          <span class="meta">使用 BotFather 创建的 Bot Token</span>
+        </div>
+        <div class="row"><label>Bot Token</label>
+          <input name="telegram_bot_token" value="{{ cfg.telegram.bot_token }}"></div>
+        <div class="row"><label>Chat ID</label>
+          <input name="telegram_chat_id" value="{{ cfg.telegram.chat_id }}"></div>
+
+        <div class="row" style="margin-top:8px">
+          <label>
+            <input type="checkbox" name="webhook_enabled"
+                   {% if cfg.webhook.enabled %}checked{% endif %}>
+            Webhook
+          </label>
+          <span class="meta">POST JSON: {title, message, ts}</span>
+        </div>
+        <div class="row"><label>URL</label>
+          <input name="webhook_url" value="{{ cfg.webhook.url }}"></div>
+      </div>
+    </div>
+
+    <div style="margin-top:16px; display:flex; gap:8px; align-items:center">
+      <button class="btn" type="submit">保存全部配置</button>
+      <span class="meta">保存后 WS 会平滑切换到新币种列表，无需重启进程</span>
+    </div>
+  </form>
+
+</div>
+</body>
+</html>

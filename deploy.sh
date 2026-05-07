@@ -67,14 +67,57 @@ ensure_repo() {
     red "❌ 未检测到 git。请先安装：yum -y install git  或  apt-get -y install git"
     exit 1
   fi
-  mkdir -p "$(dirname "$APP_DIR")"
-  if [ ! -d "$APP_DIR/.git" ]; then
-    yellow "📦 克隆仓库到 $APP_DIR ..."
-    git clone --depth=1 "$REPO" "$APP_DIR"
-  else
-    blue "✅ 已存在仓库 $APP_DIR"
-  fi
+  mkdir -p "$APP_DIR"
   cd "$APP_DIR"
+
+  if [ -d ".git" ]; then
+    blue "✅ 已存在仓库 $APP_DIR"
+    return 0
+  fi
+
+  yellow "📦 拉取仓库到 $APP_DIR ..."
+
+  # 兼容三种场景:
+  #   1) 目录完全空            → 直接 clone
+  #   2) 目录里只有用户预先 curl 的 deploy.sh
+  #   3) 目录里已有 .env / data 等用户数据
+  # 统一策略：先 clone 到临时目录，再把内容平移过来，
+  #          已存在的 .env / data 会被保留，不会被覆盖。
+  local tmpdir
+  tmpdir="$(mktemp -d -t tix-clone.XXXXXX)"
+  if ! git clone --depth=1 "$REPO" "$tmpdir/repo"; then
+    red "❌ git clone 失败，请检查网络或 GitHub 访问"
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+
+  shopt -s dotglob nullglob
+  local src name
+  for src in "$tmpdir/repo/"*; do
+    name="$(basename "$src")"
+    case "$name" in
+      .env|.env.*)
+        # 保留用户已有的 .env
+        if [ -e "$APP_DIR/$name" ]; then
+          continue
+        fi
+        ;;
+      data)
+        # 保留用户已有的 data 目录（SQLite 数据）
+        if [ -e "$APP_DIR/data" ]; then
+          continue
+        fi
+        ;;
+    esac
+    if [ -e "$APP_DIR/$name" ]; then
+      rm -rf "$APP_DIR/$name"
+    fi
+    mv "$src" "$APP_DIR/$name"
+  done
+  shopt -u dotglob nullglob
+
+  rm -rf "$tmpdir"
+  green "✅ 仓库已就绪"
 }
 
 ensure_env() {
@@ -137,8 +180,8 @@ cmd_install() {
 cmd_update() {
   ensure_docker
   if [ ! -d "$APP_DIR/.git" ]; then
-    red "❌ $APP_DIR 不是 git 仓库，请先执行 install"
-    exit 1
+    yellow "🔁 当前目录还不是 git 仓库，自动初始化 ..."
+    ensure_repo
   fi
   cd "$APP_DIR"
   yellow "🔄 拉取最新代码 ..."

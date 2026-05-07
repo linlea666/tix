@@ -55,6 +55,48 @@ class AlertRecord:
         }
 
 
+@dataclass
+class ActiveAlert:
+    key: str
+    symbol: str
+    kind: str
+    level: Optional[float]
+    title: str
+    message: str
+    price: float
+    first_at: float
+    last_notify_at: float
+    notify_count: int
+    ack: bool
+    ack_at: Optional[float]
+    pushover_receipt: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "key": self.key,
+            "symbol": self.symbol,
+            "kind": self.kind,
+            "level": self.level,
+            "title": self.title,
+            "message": self.message,
+            "price": self.price,
+            "first_at": self.first_at,
+            "last_notify_at": self.last_notify_at,
+            "notify_count": self.notify_count,
+            "ack": self.ack,
+            "ack_at": self.ack_at,
+            "pushover_receipt": self.pushover_receipt,
+        }
+
+
+def make_alert_key(symbol: str, kind: str, level: Optional[float] = None) -> str:
+    """规范化的 active_alerts 主键。"""
+    if level is None:
+        return f"{symbol}:{kind}"
+    # 用 g 格式避免 80000.0 / 80000 不一致
+    return f"{symbol}:{kind}:{level:g}"
+
+
 class StateStore:
     def __init__(self, history_maxlen: int = DEFAULT_HISTORY_MAXLEN) -> None:
         self._lock = threading.RLock()
@@ -132,6 +174,174 @@ class StateStore:
             n = cur.fetchone()["n"]
             cur.execute("DELETE FROM alerts")
         return int(n)
+
+    # -------- active alerts (Firing / Ack / Resolved 三态) --------
+    @staticmethod
+    def _row_to_active(row) -> ActiveAlert:
+        # row 可能没有 pushover_receipt 列（极旧 DB 未迁移），用 try 取值
+        try:
+            receipt = row["pushover_receipt"]
+        except (IndexError, KeyError):
+            receipt = None
+        return ActiveAlert(
+            key=row["key"],
+            symbol=row["symbol"],
+            kind=row["kind"],
+            level=row["level"],
+            title=row["title"],
+            message=row["message"],
+            price=row["price"],
+            first_at=row["first_at"],
+            last_notify_at=row["last_notify_at"],
+            notify_count=int(row["notify_count"]),
+            ack=bool(row["ack"]),
+            ack_at=row["ack_at"],
+            pushover_receipt=receipt,
+        )
+
+    def upsert_active(
+        self,
+        key: str,
+        symbol: str,
+        kind: str,
+        level: Optional[float],
+        title: str,
+        message: str,
+        price: float,
+    ) -> tuple[bool, ActiveAlert]:
+        """Upsert active alert。返回 (是否新建, 当前记录)。
+        - 新建时立即返回（调用方负责发首条推送）
+        - 已存在时只更新 message/price/title（保持 first_at/notify_count 不变）
+        """
+        now = time.time()
+        with db.cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM active_alerts WHERE key=?", (key,)
+            ).fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    INSERT INTO active_alerts (
+                        key, symbol, kind, level,
+                        title, message, price,
+                        first_at, last_notify_at, notify_count, ack, ack_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (key, symbol, kind, level, title, message, price,
+                     now, now, 1, 0, None),
+                )
+                row = cur.execute(
+                    "SELECT * FROM active_alerts WHERE key=?", (key,)
+                ).fetchone()
+                return True, self._row_to_active(row)
+            else:
+                cur.execute(
+                    """
+                    UPDATE active_alerts
+                       SET title=?, message=?, price=?
+                     WHERE key=?
+                    """,
+                    (title, message, price, key),
+                )
+                row = cur.execute(
+                    "SELECT * FROM active_alerts WHERE key=?", (key,)
+                ).fetchone()
+                return False, self._row_to_active(row)
+
+    def list_active(
+        self,
+        only_unacked: bool = False,
+        symbol: Optional[str] = None,
+    ) -> List[ActiveAlert]:
+        sql = "SELECT * FROM active_alerts"
+        clauses, params = [], []
+        if only_unacked:
+            clauses.append("ack=0")
+        if symbol:
+            clauses.append("symbol=?")
+            params.append(symbol)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY first_at ASC"
+        with db.cursor() as cur:
+            return [self._row_to_active(r) for r in cur.execute(sql, params)]
+
+    def ack_active(self, key: str) -> bool:
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE active_alerts SET ack=1, ack_at=? WHERE key=? AND ack=0",
+                (time.time(), key),
+            )
+            return cur.rowcount > 0
+
+    def ack_all_active(self) -> int:
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE active_alerts SET ack=1, ack_at=? WHERE ack=0",
+                (time.time(),),
+            )
+            return int(cur.rowcount)
+
+    def resolve_active(self, key: str) -> Optional[ActiveAlert]:
+        """删除一条 active 记录，返回被删除的副本（用于发"已解除"消息）。"""
+        with db.cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM active_alerts WHERE key=?", (key,)
+            ).fetchone()
+            if row is None:
+                return None
+            rec = self._row_to_active(row)
+            cur.execute("DELETE FROM active_alerts WHERE key=?", (key,))
+            return rec
+
+    def drop_active_by_symbol(self, symbol: str) -> int:
+        with db.cursor() as cur:
+            cur.execute(
+                "DELETE FROM active_alerts WHERE symbol=?", (symbol,)
+            )
+            return int(cur.rowcount)
+
+    def update_active_notify(
+        self,
+        key: str,
+        ts: float,
+        receipt: Optional[str] = None,
+    ) -> None:
+        """重发后调用：更新 last_notify_at + count，并刷新 receipt（若有）。"""
+        with db.cursor() as cur:
+            if receipt is None:
+                cur.execute(
+                    "UPDATE active_alerts "
+                    "  SET last_notify_at=?, notify_count=notify_count+1 "
+                    "WHERE key=?",
+                    (ts, key),
+                )
+            else:
+                cur.execute(
+                    "UPDATE active_alerts "
+                    "  SET last_notify_at=?, notify_count=notify_count+1, "
+                    "      pushover_receipt=?, ack=0, ack_at=NULL "
+                    "WHERE key=?",
+                    (ts, receipt, key),
+                )
+
+    def set_active_receipt(self, key: str, receipt: Optional[str]) -> None:
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE active_alerts SET pushover_receipt=? WHERE key=?",
+                (receipt, key),
+            )
+
+    def mark_active_acked(
+        self, key: str, ts: Optional[float] = None
+    ) -> bool:
+        """由 Pushover receipt 查询发现已 ack 时调用。返回是否实际改变状态。"""
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE active_alerts SET ack=1, ack_at=? WHERE key=? AND ack=0",
+                (ts or time.time(), key),
+            )
+            return cur.rowcount > 0
 
     # -------- snapshot --------
     def snapshot(self) -> Dict[str, Any]:

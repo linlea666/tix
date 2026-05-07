@@ -14,6 +14,7 @@ Tix · 多币种黑天鹅监控系统 — FastAPI 入口。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
@@ -39,6 +40,7 @@ import config
 import db
 import feed
 import notifier
+import reminder
 import state
 
 logging.basicConfig(
@@ -70,10 +72,19 @@ async def lifespan(app: FastAPI):
     db.init()
     config.load()
     await feed.manager.start()
+    reminder_stop = asyncio.Event()
+    reminder_task = asyncio.create_task(
+        reminder.loop(reminder_stop), name="tix-reminder"
+    )
     log.info("tix started: %d coins", len(config.get().coins))
     try:
         yield
     finally:
+        reminder_stop.set()
+        try:
+            await asyncio.wait_for(reminder_task, timeout=10)
+        except asyncio.TimeoutError:
+            reminder_task.cancel()
         await feed.manager.stop()
         db.close()
         log.info("tix stopped")
@@ -91,6 +102,28 @@ def _parse_floats(raw: str) -> list[float]:
         for x in (raw or "").replace(" ", "").split(",")
         if x.strip()
     ]
+
+
+def _collect_levels(form, sym: str, side: str) -> list[float]:
+    """支持两种 form 字段格式:
+    - 行项目化: ``coin__{sym}__{side}[]`` 多个同名值（新 UI）
+    - 旧逗号分隔: ``coin__{sym}__{side}`` 单个 input
+    """
+    arr_name = f"coin__{sym}__{side}[]"
+    legacy_name = f"coin__{sym}__{side}"
+    out: list[float] = []
+    list_vals = form.getlist(arr_name) if hasattr(form, "getlist") else []
+    if list_vals:
+        for v in list_vals:
+            try:
+                v = (v or "").strip()
+                if v:
+                    out.append(float(v))
+            except ValueError:
+                continue
+    else:
+        out = _parse_floats(form.get(legacy_name) or "")
+    return out
 
 
 def _flash(request: Request, msg: str, level: str = "ok") -> RedirectResponse:
@@ -112,6 +145,7 @@ def _flash(request: Request, msg: str, level: str = "ok") -> RedirectResponse:
 def index(request: Request, _user: str = Depends(auth)) -> HTMLResponse:
     cfg = config.get()
     snap = state.store.snapshot()
+    actives = [a.to_dict() for a in state.store.list_active()]
 
     flash = None
     raw_flash = request.cookies.get("tix_flash")
@@ -130,6 +164,7 @@ def index(request: Request, _user: str = Depends(auth)) -> HTMLResponse:
             "request": request,
             "cfg": cfg,
             "snapshot": snap,
+            "actives": actives,
             "now": time.time(),
             "flash": flash,
         },
@@ -170,13 +205,14 @@ async def save(
     coins: dict[str, config.CoinConfig] = {}
     for sym in submitted_syms:
         try:
+            repeat = int(
+                form.get(f"coin__{sym}__repeat_interval")
+                or form.get(f"coin__{sym}__cooldown")
+                or 300
+            )
             coins[sym] = config.CoinConfig(
-                price_below_list=_parse_floats(
-                    form.get(f"coin__{sym}__below") or ""
-                ),
-                price_above_list=_parse_floats(
-                    form.get(f"coin__{sym}__above") or ""
-                ),
+                price_below_list=_collect_levels(form, sym, "below"),
+                price_above_list=_collect_levels(form, sym, "above"),
                 flash_crash=config.CrashRule(
                     window_sec=int(form.get(f"coin__{sym}__flash_window") or 60),
                     drop_pct=float(form.get(f"coin__{sym}__flash_drop") or -2.5),
@@ -185,7 +221,8 @@ async def save(
                     window_sec=int(form.get(f"coin__{sym}__slow_window") or 300),
                     drop_pct=float(form.get(f"coin__{sym}__slow_drop") or -5.0),
                 ),
-                cooldown=int(form.get(f"coin__{sym}__cooldown") or 300),
+                cooldown=repeat,
+                repeat_interval_sec=repeat,
                 hysteresis_pct=float(form.get(f"coin__{sym}__hysteresis") or 0.5),
                 enabled=bool(form.get(f"coin__{sym}__enabled")),
             )
@@ -226,6 +263,7 @@ async def delete_coin(
         cfg.coins.pop(sym)
         config.update(cfg)
         state.store.drop(sym)
+        state.store.drop_active_by_symbol(sym)
         await feed.manager.refresh()
         return _flash(request, f"🗑️ 已删除 {sym.upper()}", "ok")
     return _flash(request, f"未找到币种 {sym}", "warn")
@@ -281,6 +319,32 @@ async def clear_alerts(
     return _flash(request, f"🧹 已清空 {n} 条告警历史", "ok")
 
 
+# ------------------------------ active alerts ------------------------------
+
+
+@app.post("/alerts/{key:path}/resolve")
+async def resolve_alert(
+    key: str, request: Request, _user: str = Depends(auth)
+) -> Response:
+    """手动 resolve 一条 active 告警（兜底：用户没用 Pushover 时也能停止重发）。"""
+    rec = state.store.resolve_active(key)
+    if rec is None:
+        return _flash(request, f"未找到告警 {key}", "warn")
+    return _flash(
+        request,
+        f"✅ 已 resolve {rec.symbol.upper()} {rec.kind} (共发送 {rec.notify_count} 次)",
+        "ok",
+    )
+
+
+@app.post("/alerts/ack-all")
+async def ack_all(
+    request: Request, _user: str = Depends(auth)
+) -> Response:
+    n = state.store.ack_all_active()
+    return _flash(request, f"已 ack 全部 ({n} 条)，停止重发", "ok")
+
+
 # ------------------------------ notifications ------------------------------
 
 
@@ -322,6 +386,11 @@ def api_alerts(
 ) -> dict:
     rs = state.store.alerts(limit=min(max(1, limit), 1000), symbol=symbol)
     return {"alerts": [a.to_dict() for a in rs]}
+
+
+@app.get("/api/active")
+def api_active(_user: str = Depends(auth)) -> dict:
+    return {"active": [a.to_dict() for a in state.store.list_active()]}
 
 
 # ------------------------------ health ------------------------------

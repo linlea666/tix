@@ -17,6 +17,7 @@
       --good: #2ecc71;
       --bad: #ff4d4f;
       --warn: #f39c12;
+      --fire: #ff5b3b;
     }
     * { box-sizing: border-box; }
     body {
@@ -36,16 +37,20 @@
     .card { background: var(--card); border: 1px solid var(--line);
             border-radius: 12px; padding: 16px; }
     .card.disabled { opacity: .55; }
+    .card.fire { border-color: var(--fire); box-shadow: 0 0 0 1px var(--fire) inset; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mut); }
     .dot.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
     .dot.off { background: var(--bad); }
     .dot.idle { background: var(--warn); }
+    .dot.fire { background: var(--fire); box-shadow: 0 0 10px var(--fire);
+                animation: pulse 1.2s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% {opacity:1;} 50% {opacity:.4;} }
     .row { display: grid; grid-template-columns: 130px 1fr;
            gap: 8px; align-items: center; margin: 6px 0; }
     .row.dual { grid-template-columns: 130px 1fr 1fr; }
     label { color: var(--mut); font-size: 12px; }
     input, select, button { font: inherit; }
-    input[type=text], input[type=password], input:not([type]) {
+    input[type=text], input[type=password], input[type=number], input:not([type]) {
       width: 100%; padding: 8px 10px; border: 1px solid var(--line);
       background: #0e1116; color: var(--fg); border-radius: 6px;
     }
@@ -63,11 +68,13 @@
     .btn.danger { background: #b3261e; }
     .btn.warn { background: #c87f00; }
     .btn.ok { background: #1f8a4f; }
+    .btn.fire { background: var(--fire); }
     .toolbar { display: flex; align-items: center; gap: 10px;
                margin: 14px 0 18px; flex-wrap: wrap; }
     .pill { padding: 3px 10px; font-size: 12px; background: #0e1116;
             border: 1px solid var(--line); border-radius: 999px;
             color: var(--mut); }
+    .pill.fire { color: var(--fire); border-color: var(--fire); }
     .alerts { max-height: 360px; overflow: auto; padding-right: 4px; }
     .alert { padding: 8px 0; border-bottom: 1px dashed var(--line); }
     .alert:last-child { border-bottom: 0; }
@@ -82,6 +89,50 @@
     .flash.ok { background: rgba(46,204,113,.08); border-color: rgba(46,204,113,.4); }
     .flash.warn { background: rgba(243,156,18,.08); border-color: rgba(243,156,18,.4); }
     form.inline { display: inline; }
+
+    /* ---- 价格列表行项目化 ---- */
+    .lev-list { display: grid; gap: 6px; margin-top: 4px; }
+    .lev-row {
+      display: grid; grid-template-columns: 1fr 36px;
+      gap: 6px; align-items: center;
+    }
+    .lev-row input { padding: 6px 8px; }
+    .lev-del {
+      background: transparent; color: var(--mut);
+      border: 1px solid var(--line); border-radius: 6px;
+      cursor: pointer; padding: 4px 0;
+    }
+    .lev-del:hover { color: var(--bad); border-color: var(--bad); }
+    .lev-add {
+      background: transparent; color: var(--accent);
+      border: 1px dashed var(--line); border-radius: 6px;
+      padding: 6px 10px; cursor: pointer; font-size: 12px;
+      width: 100%; text-align: left;
+    }
+    .lev-add:hover { border-color: var(--accent); }
+
+    /* ---- active 告警面板 ---- */
+    .active-card {
+      border: 1px solid var(--fire);
+      background: linear-gradient(180deg, rgba(255,91,59,.08), transparent);
+    }
+    .active-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      padding: 10px 0;
+      border-bottom: 1px dashed var(--line);
+      align-items: center;
+    }
+    .active-row:last-child { border-bottom: 0; }
+    .active-row .title { font-weight: 600; }
+    .active-row .meta { color: var(--mut); font-size: 12px; margin-top: 3px; }
+    .ack-tag {
+      display: inline-block; padding: 1px 8px; border-radius: 4px;
+      font-size: 11px;
+    }
+    .ack-tag.firing { background: rgba(255,91,59,.15); color: var(--fire); }
+    .ack-tag.acked { background: rgba(46,204,113,.15); color: var(--good); }
   </style>
 </head>
 <body>
@@ -89,7 +140,7 @@
 
   <h1>🦢 Tix · 多币种黑天鹅监控</h1>
   <div class="sub">
-    FastAPI · SQLite · Binance Combined WebSocket · 多通道告警 · 自动重连 + 阈值迟滞
+    FastAPI · SQLite · Binance Combined WebSocket · Pushover Emergency + Receipt
   </div>
 
   {% if flash %}
@@ -100,7 +151,10 @@
     <span class="pill">币种 <b>{{ cfg.coins|length }}</b></span>
     {% set live_n = snapshot.coins.values()|selectattr('connected')|list|length %}
     <span class="pill">在线 <b>{{ live_n }}</b> / {{ snapshot.coins|length }}</span>
-    <span class="pill">告警 <b>{{ snapshot.alerts|length }}</b></span>
+    {% if actives %}
+      <span class="pill fire">🔥 firing <b>{{ actives|length }}</b></span>
+    {% endif %}
+    <span class="pill">告警历史 <b>{{ snapshot.alerts|length }}</b></span>
     <a class="btn ghost" href="/test">测试全部通道</a>
     <a class="btn ghost" href="/api/snapshot" target="_blank">/api/snapshot</a>
     <a class="btn ghost" href="/healthz" target="_blank">/healthz</a>
@@ -110,13 +164,51 @@
     </form>
   </div>
 
+  {% if actives %}
+  <h2 class="section-title">🔥 当前告警 ({{ actives|length }})</h2>
+  <div class="card active-card">
+    {% for a in actives %}
+      <div class="active-row">
+        <div>
+          <div class="title">
+            <span class="dot {% if a.ack %}on{% else %}fire{% endif %}"></span>
+            {{ a.title }}
+            <span class="ack-tag {% if a.ack %}acked{% else %}firing{% endif %}">
+              {% if a.ack %}已 ACK · 静默中{% else %}FIRING · 持续提醒中{% endif %}
+            </span>
+          </div>
+          <div class="meta">
+            首次触发 {{ ((now - a.first_at)|round(0,'floor'))|int }}s 前 ·
+            最后推送 {{ ((now - a.last_notify_at)|round(0,'floor'))|int }}s 前 ·
+            已发送 <b>{{ a.notify_count }}</b> 次 · price={{ a.price }}
+            {% if a.pushover_receipt %} · receipt={{ a.pushover_receipt[:8] }}…{% endif %}
+          </div>
+        </div>
+        <form method="post" action="/alerts/{{ a.key }}/resolve" class="inline"
+              onsubmit="return confirm('手动 resolve 这条告警？');">
+          <button class="btn sm ghost" type="submit">手动 Resolve</button>
+        </form>
+      </div>
+    {% endfor %}
+    <div class="actions" style="margin-top:12px">
+      <form method="post" action="/alerts/ack-all" class="inline">
+        <button class="btn sm warn" type="submit">全部 Ack（停止重发）</button>
+      </form>
+      <span class="meta">提示：手机 Pushover 客户端点 Acknowledge 后服务端会自动停止重发，无需在此操作。</span>
+    </div>
+  </div>
+  {% endif %}
+
   <h2 class="section-title">📈 实时行情</h2>
   <div class="grid">
     {% for symbol, c in cfg.coins.items() %}
       {% set s = snapshot.coins.get(symbol, {}) %}
-      <div class="card {% if not c.enabled %}disabled{% endif %}">
+      {% set has_fire = actives|selectattr('symbol','equalto',symbol)|selectattr('ack','equalto',false)|list|length > 0 %}
+      <div class="card {% if not c.enabled %}disabled{% endif %} {% if has_fire %}fire{% endif %}">
         <h2>
-          {% if not c.enabled %}
+          {% if has_fire %}
+            <span class="dot fire" title="firing"></span>
+          {% elif not c.enabled %}
             <span class="dot idle" title="已暂停"></span>
           {% elif s.get('connected') %}
             <span class="dot on" title="WS 已连接"></span>
@@ -133,8 +225,7 @@
         </h2>
         <div class="price">{{ '%g'|format(s.get('last_price') or 0) }}</div>
         <div class="meta">
-          history pts: {{ s.get('history_len') or 0 }} ·
-          triggered: {{ (s.get('triggered') or {})|length }}
+          history pts: {{ s.get('history_len') or 0 }}
         </div>
         <div class="meta" style="margin-top:6px">
           ↓ {{ c.price_below_list|join(', ') or '—' }}
@@ -143,7 +234,7 @@
           <br>
           flash {{ c.flash_crash.window_sec }}s/{{ c.flash_crash.drop_pct }}% ·
           slow {{ c.slow_crash.window_sec }}s/{{ c.slow_crash.drop_pct }}% ·
-          cd {{ c.cooldown }}s · hyst {{ c.hysteresis_pct }}%
+          重发 {{ c.repeat_interval_sec }}s · hyst {{ c.hysteresis_pct }}%
         </div>
         <div class="actions">
           <form method="post" action="/coin/{{ symbol }}/toggle" class="inline">
@@ -194,18 +285,33 @@
               监控开启
             </label>
           </div>
+
           <div class="row">
-            <label>跌破列表</label>
-            <input name="coin__{{ symbol }}__below"
-                   value="{{ c.price_below_list|join(', ') }}"
-                   placeholder="逗号分隔，例如 80000, 75000">
+            <label>跌破价格</label>
+            <div class="lev-list" data-list="below" data-prefix="coin__{{ symbol }}__below">
+              {% for v in c.price_below_list %}
+                <div class="lev-row">
+                  <input name="coin__{{ symbol }}__below[]" value="{{ v }}" placeholder="例如 80000">
+                  <button type="button" class="lev-del" title="删除">✕</button>
+                </div>
+              {% endfor %}
+              <button type="button" class="lev-add">+ 添加跌破价格</button>
+            </div>
           </div>
+
           <div class="row">
-            <label>突破列表</label>
-            <input name="coin__{{ symbol }}__above"
-                   value="{{ c.price_above_list|join(', ') }}"
-                   placeholder="逗号分隔，例如 90000, 95000">
+            <label>突破价格</label>
+            <div class="lev-list" data-list="above" data-prefix="coin__{{ symbol }}__above">
+              {% for v in c.price_above_list %}
+                <div class="lev-row">
+                  <input name="coin__{{ symbol }}__above[]" value="{{ v }}" placeholder="例如 90000">
+                  <button type="button" class="lev-del" title="删除">✕</button>
+                </div>
+              {% endfor %}
+              <button type="button" class="lev-add">+ 添加突破价格</button>
+            </div>
           </div>
+
           <div class="row dual">
             <label>瞬时窗/跌幅%</label>
             <input name="coin__{{ symbol }}__flash_window"
@@ -221,9 +327,10 @@
                    value="{{ c.slow_crash.drop_pct }}">
           </div>
           <div class="row dual">
-            <label>冷却/迟滞%</label>
-            <input name="coin__{{ symbol }}__cooldown"
-                   value="{{ c.cooldown }}">
+            <label>重发间隔 / 迟滞%</label>
+            <input name="coin__{{ symbol }}__repeat_interval"
+                   value="{{ c.repeat_interval_sec }}"
+                   title="持续提醒模型：每 N 秒重发，0 = 关闭重发">
             <input name="coin__{{ symbol }}__hysteresis"
                    value="{{ c.hysteresis_pct }}">
           </div>
@@ -237,7 +344,7 @@
           <input name="add_symbol" placeholder="例如 solusdt">
         </div>
         <div class="meta">
-          提交后以默认参数加入，自动接入到 WS 单连接，无需重启进程。
+          新币默认参数自动接入，保存后即时生效。
         </div>
       </div>
 
@@ -250,7 +357,7 @@
                    {% if cfg.pushover.enabled %}checked{% endif %}>
             Pushover
           </label>
-          <span class="meta">紧急推送 (priority=2 + retry/expire)</span>
+          <span class="meta">priority=2 紧急；服务端用 receipts 检测 ack，自动停发</span>
         </div>
         <div class="row"><label>Token</label>
           <input name="pushover_token" value="{{ cfg.pushover.token }}"></div>
@@ -319,5 +426,31 @@
   </form>
 
 </div>
+
+<script>
+// 价格行项目化：➕ 添加 / ✕ 删除
+document.addEventListener('click', (e) => {
+  const t = e.target;
+  if (t.classList.contains('lev-del')) {
+    e.preventDefault();
+    t.closest('.lev-row')?.remove();
+    return;
+  }
+  if (t.classList.contains('lev-add')) {
+    e.preventDefault();
+    const list = t.closest('.lev-list');
+    if (!list) return;
+    const prefix = list.dataset.prefix;
+    const row = document.createElement('div');
+    row.className = 'lev-row';
+    row.innerHTML =
+      '<input name="' + prefix + '[]" value="" placeholder="价格">' +
+      '<button type="button" class="lev-del" title="删除">✕</button>';
+    list.insertBefore(row, t);
+    row.querySelector('input').focus();
+  }
+});
+</script>
+
 </body>
 </html>

@@ -33,7 +33,14 @@ class CoinConfig(BaseModel):
     price_above_list: List[float] = Field(default_factory=list)
     flash_crash: CrashRule = CrashRule(window_sec=60, drop_pct=-2.5)
     slow_crash: CrashRule = CrashRule(window_sec=300, drop_pct=-5.0)
-    cooldown: int = Field(default=300, ge=0, description="冷却时间(秒)")
+    cooldown: int = Field(
+        default=300, ge=0,
+        description="(已弃用，保留兼容) 边沿模型下的最小间隔",
+    )
+    repeat_interval_sec: int = Field(
+        default=300, ge=0, le=86400,
+        description="持续提醒模型：每 N 秒重发一次（直到 Pushover ack 或价格回归）。0 = 关闭重发。",
+    )
     hysteresis_pct: float = Field(
         default=0.5, ge=0, le=50,
         description="阈值迟滞带 (%)，防止抖动重复触发",
@@ -110,6 +117,11 @@ _cached: AppConfig = _DEFAULT_SEED.model_copy(deep=True)
 
 
 def _row_to_coin(r) -> CoinConfig:
+    # repeat_interval_sec 是后加列，旧库可能没有 → 回退到 cooldown
+    try:
+        rep = int(r["repeat_interval_sec"])
+    except (IndexError, KeyError, TypeError):
+        rep = int(r["cooldown"])
     return CoinConfig(
         price_below_list=json.loads(r["price_below_list"]),
         price_above_list=json.loads(r["price_above_list"]),
@@ -122,6 +134,7 @@ def _row_to_coin(r) -> CoinConfig:
             drop_pct=float(r["slow_drop_pct"]),
         ),
         cooldown=int(r["cooldown"]),
+        repeat_interval_sec=rep,
         hysteresis_pct=float(r["hysteresis_pct"]),
         enabled=bool(r["enabled"]),
     )
@@ -164,6 +177,7 @@ def _write_db(cfg: AppConfig) -> None:
                 c.slow_crash.window_sec,
                 c.slow_crash.drop_pct,
                 c.cooldown,
+                c.repeat_interval_sec,
                 c.hysteresis_pct,
                 1 if c.enabled else 0,
                 now,
@@ -175,7 +189,8 @@ def _write_db(cfg: AppConfig) -> None:
                         price_below_list=?, price_above_list=?,
                         flash_window_sec=?, flash_drop_pct=?,
                         slow_window_sec=?,  slow_drop_pct=?,
-                        cooldown=?, hysteresis_pct=?,
+                        cooldown=?, repeat_interval_sec=?,
+                        hysteresis_pct=?,
                         enabled=?, updated_at=?
                     WHERE symbol=?
                     """,
@@ -188,9 +203,9 @@ def _write_db(cfg: AppConfig) -> None:
                         (price_below_list, price_above_list,
                          flash_window_sec, flash_drop_pct,
                          slow_window_sec,  slow_drop_pct,
-                         cooldown, hysteresis_pct, enabled,
+                         cooldown, repeat_interval_sec, hysteresis_pct, enabled,
                          updated_at, symbol, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     row + (sym, now),
                 )

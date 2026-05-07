@@ -1,26 +1,26 @@
 """
-配置层：Pydantic schema + 原子持久化 + 线程安全访问。
+配置层：Pydantic schema 校验 + SQLite 持久化 + 内存缓存。
 
-设计要点：
-- 任何读取都通过 ``get()``，确保拿到一致的快照。
-- 任何写入都通过 ``update()``，先校验再 tmp+rename 原子写盘。
-- 解析失败时备份坏文件为 .bad，使用默认配置避免静默丢失数据。
+存储拆分:
+- 表 ``coins``：每币一行（便于增删改查、可视化）
+- 表 ``settings``：``pushover/telegram/webhook/auth`` 各 1 行 JSON
+
+调用方一律用 ``get()`` 读快照（深拷贝，无锁污染），用 ``update()`` 写。
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-import tempfile
 import threading
-from pathlib import Path
-from typing import Dict, List
+import time
+from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-log = logging.getLogger("tix.config")
+import db
 
-CONFIG_FILE = Path(os.environ.get("TIX_CONFIG", "config.json"))
+log = logging.getLogger("tix.config")
 
 
 class CrashRule(BaseModel):
@@ -35,11 +35,10 @@ class CoinConfig(BaseModel):
     slow_crash: CrashRule = CrashRule(window_sec=300, drop_pct=-5.0)
     cooldown: int = Field(default=300, ge=0, description="冷却时间(秒)")
     hysteresis_pct: float = Field(
-        default=0.5,
-        ge=0,
-        le=50,
+        default=0.5, ge=0, le=50,
         description="阈值迟滞带 (%)，防止抖动重复触发",
     )
+    enabled: bool = Field(default=True, description="是否启用监控")
 
     @field_validator("price_below_list", "price_above_list")
     @classmethod
@@ -68,7 +67,6 @@ class WebhookConfig(BaseModel):
 
 class WebAuthConfig(BaseModel):
     username: str = "admin"
-    # 第一次启动后请通过 TIX_AUTH_PASSWORD 环境变量或修改 config.json 立刻替换
     password: str = "changeme"
 
 
@@ -87,7 +85,7 @@ class AppConfig(BaseModel):
         return {k.lower().strip(): val for k, val in v.items() if k.strip()}
 
 
-DEFAULT = AppConfig(
+_DEFAULT_SEED = AppConfig(
     coins={
         "btcusdt": CoinConfig(
             price_below_list=[80000, 75000],
@@ -104,82 +102,174 @@ DEFAULT = AppConfig(
     }
 )
 
-
 _lock = threading.RLock()
-_cached: AppConfig = DEFAULT.model_copy(deep=True)
+_cached: AppConfig = _DEFAULT_SEED.model_copy(deep=True)
 
 
-def _atomic_write(path: Path, payload: str) -> None:
-    parent = path.parent if str(path.parent) else Path(".")
-    parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".cfg-", suffix=".tmp", dir=str(parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+# ---------------------------- helpers ----------------------------
+
+
+def _row_to_coin(r) -> CoinConfig:
+    return CoinConfig(
+        price_below_list=json.loads(r["price_below_list"]),
+        price_above_list=json.loads(r["price_above_list"]),
+        flash_crash=CrashRule(
+            window_sec=int(r["flash_window_sec"]),
+            drop_pct=float(r["flash_drop_pct"]),
+        ),
+        slow_crash=CrashRule(
+            window_sec=int(r["slow_window_sec"]),
+            drop_pct=float(r["slow_drop_pct"]),
+        ),
+        cooldown=int(r["cooldown"]),
+        hysteresis_pct=float(r["hysteresis_pct"]),
+        enabled=bool(r["enabled"]),
+    )
+
+
+def _read_db() -> AppConfig:
+    with db.cursor() as cur:
+        cur.execute("SELECT * FROM coins ORDER BY symbol")
+        coins = {r["symbol"]: _row_to_coin(r) for r in cur.fetchall()}
+        cur.execute("SELECT section, data FROM settings")
+        sections: Dict[str, Any] = {
+            r["section"]: json.loads(r["data"]) for r in cur.fetchall()
+        }
+    return AppConfig(
+        coins=coins,
+        pushover=PushoverConfig(**sections.get("pushover", {})),
+        telegram=TelegramConfig(**sections.get("telegram", {})),
+        webhook=WebhookConfig(**sections.get("webhook", {})),
+        auth=WebAuthConfig(**sections.get("auth", {})),
+    )
+
+
+def _write_db(cfg: AppConfig) -> None:
+    """把整个 AppConfig 全量同步到 SQLite（事务原子）。"""
+    now = time.time()
+    with db.transaction() as cur:
+        cur.execute("SELECT symbol FROM coins")
+        existing = {r["symbol"] for r in cur.fetchall()}
+        new = set(cfg.coins.keys())
+
+        for sym in existing - new:
+            cur.execute("DELETE FROM coins WHERE symbol=?", (sym,))
+
+        for sym, c in cfg.coins.items():
+            row = (
+                json.dumps(c.price_below_list),
+                json.dumps(c.price_above_list),
+                c.flash_crash.window_sec,
+                c.flash_crash.drop_pct,
+                c.slow_crash.window_sec,
+                c.slow_crash.drop_pct,
+                c.cooldown,
+                c.hysteresis_pct,
+                1 if c.enabled else 0,
+                now,
+            )
+            if sym in existing:
+                cur.execute(
+                    """
+                    UPDATE coins SET
+                        price_below_list=?, price_above_list=?,
+                        flash_window_sec=?, flash_drop_pct=?,
+                        slow_window_sec=?,  slow_drop_pct=?,
+                        cooldown=?, hysteresis_pct=?,
+                        enabled=?, updated_at=?
+                    WHERE symbol=?
+                    """,
+                    row + (sym,),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO coins
+                        (price_below_list, price_above_list,
+                         flash_window_sec, flash_drop_pct,
+                         slow_window_sec,  slow_drop_pct,
+                         cooldown, hysteresis_pct, enabled,
+                         updated_at, symbol, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    row + (sym, now),
+                )
+
+        for section, data in (
+            ("pushover", cfg.pushover.model_dump()),
+            ("telegram", cfg.telegram.model_dump()),
+            ("webhook", cfg.webhook.model_dump()),
+            ("auth", cfg.auth.model_dump()),
+        ):
+            cur.execute(
+                """
+                INSERT INTO settings (section, data, updated_at)
+                VALUES (?,?,?)
+                ON CONFLICT(section) DO UPDATE SET
+                    data       = excluded.data,
+                    updated_at = excluded.updated_at
+                """,
+                (section, json.dumps(data, ensure_ascii=False), now),
+            )
+
+
+def _seed_if_empty() -> bool:
+    """空库时写入默认种子。返回是否实际写入。"""
+    with db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM coins")
+        coin_n = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM settings")
+        setting_n = cur.fetchone()["n"]
+    if coin_n == 0 and setting_n == 0:
+        _write_db(_DEFAULT_SEED)
+        log.info("seeded default config (2 coins)")
+        return True
+    return False
+
+
+# ---------------------------- public API ----------------------------
 
 
 def load() -> AppConfig:
-    """从磁盘加载配置；首次启动写入默认；解析失败时备份并回退默认。"""
+    """从 SQLite 加载到内存缓存。空库时写入默认种子。"""
     global _cached
+    db.init()
     with _lock:
-        if not CONFIG_FILE.exists():
-            _atomic_write(
-                CONFIG_FILE,
-                json.dumps(DEFAULT.model_dump(), indent=2, ensure_ascii=False),
-            )
-            _cached = DEFAULT.model_copy(deep=True)
-            log.info("config not found, wrote default to %s", CONFIG_FILE)
-            return _cached
-        try:
-            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            _cached = AppConfig.model_validate(raw)
-            log.info("config loaded: %d coins", len(_cached.coins))
-        except (json.JSONDecodeError, ValidationError) as e:
-            backup = CONFIG_FILE.with_suffix(".bad")
-            try:
-                CONFIG_FILE.replace(backup)
-            except OSError:
-                pass
-            _atomic_write(
-                CONFIG_FILE,
-                json.dumps(DEFAULT.model_dump(), indent=2, ensure_ascii=False),
-            )
-            _cached = DEFAULT.model_copy(deep=True)
-            log.error(
-                "config invalid (%s); backed up to %s and using DEFAULT",
-                e, backup,
-            )
-        # 环境变量覆盖密码（容器化部署常用）
+        _seed_if_empty()
+        _cached = _read_db()
+
+        # 环境变量优先：仅运行时覆盖密码，不写回 db（避免容器更新泄漏）
         env_pwd = os.environ.get("TIX_AUTH_PASSWORD")
         if env_pwd:
             _cached.auth.password = env_pwd
-        return _cached
+
+        log.info("config loaded: %d coins", len(_cached.coins))
+        return _cached.model_copy(deep=True)
 
 
 def get() -> AppConfig:
-    """获取当前缓存的配置（深拷贝，保证调用方不会污染共享状态）。"""
     with _lock:
         return _cached.model_copy(deep=True)
 
 
 def update(cfg: AppConfig) -> AppConfig:
-    """校验、原子写盘、刷新缓存。"""
+    """校验 + 原子写入 + 刷新缓存。"""
     global _cached
     validated = AppConfig.model_validate(cfg.model_dump())
     with _lock:
-        _atomic_write(
-            CONFIG_FILE,
-            json.dumps(validated.model_dump(), indent=2, ensure_ascii=False),
-        )
+        _write_db(validated)
         _cached = validated
         log.info("config updated: %d coins", len(_cached.coins))
         return _cached.model_copy(deep=True)
+
+
+def update_password(new_password: str) -> None:
+    """单独修改 admin 密码（不动其他配置）。"""
+    new_password = (new_password or "").strip()
+    if not new_password:
+        raise ValueError("password must not be empty")
+    if len(new_password) < 4:
+        raise ValueError("password too short (min 4 chars)")
+    cfg = get()
+    cfg.auth.password = new_password
+    update(cfg)

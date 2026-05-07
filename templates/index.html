@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Tix · 多币种黑天鹅监控</title>
-  <meta http-equiv="refresh" content="15" />
+  <meta http-equiv="refresh" content="20" />
   <style>
     :root {
       color-scheme: dark;
@@ -35,15 +35,17 @@
             grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
     .card { background: var(--card); border: 1px solid var(--line);
             border-radius: 12px; padding: 16px; }
+    .card.disabled { opacity: .55; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mut); }
     .dot.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
     .dot.off { background: var(--bad); }
+    .dot.idle { background: var(--warn); }
     .row { display: grid; grid-template-columns: 130px 1fr;
            gap: 8px; align-items: center; margin: 6px 0; }
     .row.dual { grid-template-columns: 130px 1fr 1fr; }
     label { color: var(--mut); font-size: 12px; }
     input, select, button { font: inherit; }
-    input[type=text], input:not([type]) {
+    input[type=text], input[type=password], input:not([type]) {
       width: 100%; padding: 8px 10px; border: 1px solid var(--line);
       background: #0e1116; color: var(--fg); border-radius: 6px;
     }
@@ -51,13 +53,16 @@
     .price { font-size: 22px; font-weight: 600; letter-spacing: .3px; }
     .meta { color: var(--mut); font-size: 12px; }
     .btn {
-      padding: 9px 14px; border: 0; border-radius: 8px; cursor: pointer;
+      padding: 8px 14px; border: 0; border-radius: 8px; cursor: pointer;
       background: var(--accent); color: #fff; font-weight: 500;
       text-decoration: none; display: inline-block;
     }
+    .btn.sm { padding: 5px 10px; font-size: 12px; }
     .btn.ghost { background: transparent; color: var(--fg);
                  border: 1px solid var(--line); }
     .btn.danger { background: #b3261e; }
+    .btn.warn { background: #c87f00; }
+    .btn.ok { background: #1f8a4f; }
     .toolbar { display: flex; align-items: center; gap: 10px;
                margin: 14px 0 18px; flex-wrap: wrap; }
     .pill { padding: 3px 10px; font-size: 12px; background: #0e1116;
@@ -68,8 +73,15 @@
     .alert:last-child { border-bottom: 0; }
     .alert .t { color: var(--mut); font-size: 12px; }
     .section-title { margin: 28px 0 12px; font-size: 18px; }
-    .group { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
     .ago { color: var(--mut); font-size: 12px; }
+    .flash {
+      padding: 10px 14px; border-radius: 10px; margin-bottom: 14px;
+      border: 1px solid var(--line);
+    }
+    .flash.ok { background: rgba(46,204,113,.08); border-color: rgba(46,204,113,.4); }
+    .flash.warn { background: rgba(243,156,18,.08); border-color: rgba(243,156,18,.4); }
+    form.inline { display: inline; }
   </style>
 </head>
 <body>
@@ -77,27 +89,42 @@
 
   <h1>🦢 Tix · 多币种黑天鹅监控</h1>
   <div class="sub">
-    FastAPI · Binance Combined WebSocket · 多通道告警 · 自动重连 + 阈值迟滞
+    FastAPI · SQLite · Binance Combined WebSocket · 多通道告警 · 自动重连 + 阈值迟滞
   </div>
+
+  {% if flash %}
+    <div class="flash {{ flash.level }}">{{ flash.msg }}</div>
+  {% endif %}
 
   <div class="toolbar">
     <span class="pill">币种 <b>{{ cfg.coins|length }}</b></span>
-    <span class="pill">告警历史 <b>{{ snapshot.alerts|length }}</b></span>
     {% set live_n = snapshot.coins.values()|selectattr('connected')|list|length %}
     <span class="pill">在线 <b>{{ live_n }}</b> / {{ snapshot.coins|length }}</span>
-    <a class="btn ghost" href="/test">测试通知</a>
+    <span class="pill">告警 <b>{{ snapshot.alerts|length }}</b></span>
+    <a class="btn ghost" href="/test">测试全部通道</a>
     <a class="btn ghost" href="/api/snapshot" target="_blank">/api/snapshot</a>
     <a class="btn ghost" href="/healthz" target="_blank">/healthz</a>
+    <form method="post" action="/alerts/clear" class="inline"
+          onsubmit="return confirm('清空所有告警历史？');">
+      <button class="btn ghost danger" type="submit">清空告警</button>
+    </form>
   </div>
 
   <h2 class="section-title">📈 实时行情</h2>
   <div class="grid">
     {% for symbol, c in cfg.coins.items() %}
       {% set s = snapshot.coins.get(symbol, {}) %}
-      <div class="card">
+      <div class="card {% if not c.enabled %}disabled{% endif %}">
         <h2>
-          <span class="dot {% if s.get('connected') %}on{% else %}off{% endif %}"></span>
+          {% if not c.enabled %}
+            <span class="dot idle" title="已暂停"></span>
+          {% elif s.get('connected') %}
+            <span class="dot on" title="WS 已连接"></span>
+          {% else %}
+            <span class="dot off" title="WS 未连接"></span>
+          {% endif %}
           {{ symbol|upper }}
+          {% if not c.enabled %}<span class="meta">(已暂停)</span>{% endif %}
           <span class="ago" style="margin-left:auto">
             {% if s.get('last_update') %}
               {{ ((now - s.get('last_update'))|round(0, 'floor'))|int }}s ago
@@ -118,11 +145,17 @@
           slow {{ c.slow_crash.window_sec }}s/{{ c.slow_crash.drop_pct }}% ·
           cd {{ c.cooldown }}s · hyst {{ c.hysteresis_pct }}%
         </div>
-        <form method="post" action="/coin/{{ symbol }}/delete"
-              style="margin-top:10px"
-              onsubmit="return confirm('删除币种 {{ symbol|upper }} ？');">
-          <button class="btn danger" type="submit">删除该币种</button>
-        </form>
+        <div class="actions">
+          <form method="post" action="/coin/{{ symbol }}/toggle" class="inline">
+            <button class="btn sm {% if c.enabled %}warn{% else %}ok{% endif %}">
+              {% if c.enabled %}⏸ 暂停{% else %}▶ 启用{% endif %}
+            </button>
+          </form>
+          <form method="post" action="/coin/{{ symbol }}/delete" class="inline"
+                onsubmit="return confirm('删除币种 {{ symbol|upper }}？');">
+            <button class="btn sm danger">🗑 删除</button>
+          </form>
+        </div>
       </div>
     {% endfor %}
 
@@ -153,6 +186,14 @@
         <div class="card">
           <h2>{{ symbol|upper }}</h2>
           <input type="hidden" name="coin__{{ symbol }}__symbol" value="{{ symbol }}">
+          <div class="row">
+            <label>启用</label>
+            <label>
+              <input type="checkbox" name="coin__{{ symbol }}__enabled"
+                     {% if c.enabled %}checked{% endif %}>
+              监控开启
+            </label>
+          </div>
           <div class="row">
             <label>跌破列表</label>
             <input name="coin__{{ symbol }}__below"
@@ -193,13 +234,16 @@
         <h2>➕ 新增币种</h2>
         <div class="row">
           <label>Symbol（小写）</label>
-          <input name="add_symbol" placeholder="例如：solusdt">
+          <input name="add_symbol" placeholder="例如 solusdt">
         </div>
-        <div class="meta">提交后会以默认参数加入，可在保存后再编辑。币种会自动接入到 WS 单连接。</div>
+        <div class="meta">
+          提交后以默认参数加入，自动接入到 WS 单连接，无需重启进程。
+        </div>
       </div>
 
       <div class="card">
         <h2>📨 通知通道</h2>
+
         <div class="row">
           <label>
             <input type="checkbox" name="pushover_enabled"
@@ -212,6 +256,9 @@
           <input name="pushover_token" value="{{ cfg.pushover.token }}"></div>
         <div class="row"><label>User</label>
           <input name="pushover_user" value="{{ cfg.pushover.user }}"></div>
+        <div class="actions">
+          <a class="btn sm ghost" href="/test?channel=pushover">测试 Pushover</a>
+        </div>
 
         <div class="row" style="margin-top:8px">
           <label>
@@ -219,12 +266,15 @@
                    {% if cfg.telegram.enabled %}checked{% endif %}>
             Telegram
           </label>
-          <span class="meta">使用 BotFather 创建的 Bot Token</span>
+          <span class="meta">BotFather 创建的 Bot Token</span>
         </div>
         <div class="row"><label>Bot Token</label>
           <input name="telegram_bot_token" value="{{ cfg.telegram.bot_token }}"></div>
         <div class="row"><label>Chat ID</label>
           <input name="telegram_chat_id" value="{{ cfg.telegram.chat_id }}"></div>
+        <div class="actions">
+          <a class="btn sm ghost" href="/test?channel=telegram">测试 Telegram</a>
+        </div>
 
         <div class="row" style="margin-top:8px">
           <label>
@@ -236,12 +286,35 @@
         </div>
         <div class="row"><label>URL</label>
           <input name="webhook_url" value="{{ cfg.webhook.url }}"></div>
+        <div class="actions">
+          <a class="btn sm ghost" href="/test?channel=webhook">测试 Webhook</a>
+        </div>
       </div>
     </div>
 
     <div style="margin-top:16px; display:flex; gap:8px; align-items:center">
-      <button class="btn" type="submit">保存全部配置</button>
+      <button class="btn" type="submit">💾 保存全部配置</button>
       <span class="meta">保存后 WS 会平滑切换到新币种列表，无需重启进程</span>
+    </div>
+  </form>
+
+  <h2 class="section-title">🔑 修改后台密码</h2>
+  <form method="post" action="/password" class="card" style="max-width:520px">
+    <div class="row">
+      <label>用户名</label>
+      <input value="{{ cfg.auth.username }}" disabled>
+    </div>
+    <div class="row">
+      <label>新密码</label>
+      <input type="password" name="password_new" placeholder="至少 4 位">
+    </div>
+    <div class="row">
+      <label>确认密码</label>
+      <input type="password" name="password_new2" placeholder="再输入一次">
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">更新密码</button>
+      <span class="meta">更新后浏览器需用新密码重新登录</span>
     </div>
   </form>
 

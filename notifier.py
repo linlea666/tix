@@ -108,6 +108,8 @@ _channels: List[Channel] = [
     WebhookChannel(),
 ]
 
+CHANNEL_NAMES = [c.name for c in _channels]
+
 
 def dispatch(title: str, message: str) -> int:
     """投递到所有启用的通道，返回成功送达的通道数。"""
@@ -119,3 +121,15 @@ def dispatch(title: str, message: str) -> int:
         except Exception:
             log.exception("channel %s crashed", ch.name)
     return delivered
+
+
+def dispatch_one(channel: str, title: str, message: str) -> bool:
+    """只向指定通道投递（用于 UI 单通道测试）。"""
+    for ch in _channels:
+        if ch.name == channel:
+            try:
+                return bool(ch.send(title, message))
+            except Exception:
+                log.exception("channel %s crashed", ch.name)
+                return False
+    return False

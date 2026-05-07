@@ -44,14 +44,13 @@ def _emit(symbol: str, kind: str, title: str, message: str, price: float) -> Non
             price=price,
         )
     )
-    state.store.persist()
     log.info("ALERT %s/%s: %s @ %s", symbol, kind, title, price)
 
 
 def process_price(symbol: str, price: float) -> None:
     cfg = config.get()
     coin_cfg = cfg.coins.get(symbol)
-    if coin_cfg is None:
+    if coin_cfg is None or not coin_cfg.enabled:
         return
 
     cs = state.store.ensure(symbol)
